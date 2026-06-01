@@ -1,0 +1,325 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.model_selection import train_test_split
+import glob
+import os
+import plotly.graph_objects as go
+
+# ─────────────────────────────────────────────
+st.set_page_config(
+    page_title="배터리 Second-Life 추천 플랫폼",
+    page_icon="🔋",
+    layout="wide"
+)
+
+st.markdown("""
+<style>
+    .main-title  { font-size:28px; font-weight:700; margin-bottom:4px; }
+    .sub-title   { font-size:14px; color:#888; margin-bottom:24px; }
+    .metric-card { background:#1a1a2e; border-radius:12px; padding:20px;
+                   text-align:center; border:1px solid #2a2a4a; }
+    .metric-val  { font-size:28px; font-weight:700; color:#00d4aa; }
+    .metric-label{ font-size:12px; color:#aaa; margin-top:4px; }
+    .rec-card    { background:#1a1a2e; border-radius:12px; padding:16px 20px;
+                   margin-bottom:10px; border:1px solid #2a2a4a; }
+    .top-card    { border:2px solid #00d4aa !important; }
+    .warn-card   { border:2px solid #e05555 !important; }
+    .section-title { font-size:18px; font-weight:600; margin:20px 0 12px; }
+</style>
+""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────
+@st.cache_resource
+def load_model(data_path):
+    all_files = glob.glob(os.path.join(data_path, '*.xls'))
+    if not all_files:
+        return None, 0
+    features, labels = [], []
+    for file in all_files:
+        try:
+            soh = int(os.path.basename(file).split('SOH')[0].split('_')[-1])
+            df  = pd.read_excel(file, engine='xlrd', header=None)
+            df.columns = ['freq', 'z_real', 'z_imag']
+            features.append([
+                df['z_real'].iloc[0],
+                df['z_real'].max(),
+                df['z_imag'].min(),
+                df['z_imag'].max(),
+                df['z_real'].mean(),
+                df['z_imag'].std(),
+            ])
+            labels.append(soh)
+        except:
+            pass
+    X, y = np.array(features), np.array(labels)
+    model = GradientBoostingRegressor(n_estimators=100, random_state=42)
+    model.fit(X, y)
+    return model, len(labels)
+
+def extract_features(df):
+    return np.array([[
+        df['z_real'].iloc[0],
+        df['z_real'].max(),
+        df['z_imag'].min(),
+        df['z_imag'].max(),
+        df['z_real'].mean(),
+        df['z_imag'].std(),
+    ]])
+
+def get_recommendations(soh, years, cycles, bat_type):
+    # 사용 연수·사이클에 따른 패널티
+    age_penalty   = years  * 0.3
+    cycle_penalty = cycles * 0.002
+
+    apps = [
+        {
+            "name": "가정용 ESS",
+            "icon": "🏠",
+            "desc": "저출력 장기 사용. 태양광 패널과 연계해 잉여전력 저장.",
+            "score": max(10, soh - age_penalty - cycle_penalty + 5),
+            "life": max(1, round((soh - 60) / 8 - years * 0.1)),
+            "value": round(soh * 2.5),
+            "carbon": round(soh * 8),
+            "condition": soh >= 75,
+        },
+        {
+            "name": "태양광 연계 ESS",
+            "icon": "☀️",
+            "desc": "재생에너지 저장에 최적. 낮은 충방전 반복 환경.",
+            "score": max(10, soh - age_penalty - cycle_penalty + 10),
+            "life": max(1, round((soh - 65) / 7 - years * 0.1)),
+            "value": round(soh * 3.2),
+            "carbon": round(soh * 12),
+            "condition": soh >= 70,
+        },
+        {
+            "name": "통신기지국 백업전원",
+            "icon": "📡",
+            "desc": "간헐적 방전 환경. 안정적 출력 유지.",
+            "score": max(10, soh - age_penalty - cycle_penalty),
+            "life": max(1, round((soh - 55) / 10 - years * 0.1)),
+            "value": round(soh * 2.8),
+            "carbon": round(soh * 7),
+            "condition": soh >= 65,
+        },
+        {
+            "name": "UPS 비상전원",
+            "icon": "🏥",
+            "desc": "병원·데이터센터 비상전원. 단기 방전 위주.",
+            "score": max(10, soh - age_penalty - cycle_penalty - 5),
+            "life": max(1, round((soh - 50) / 12 - years * 0.1)),
+            "value": round(soh * 2.2),
+            "carbon": round(soh * 6),
+            "condition": soh >= 60,
+        },
+    ]
+    valid = [a for a in apps if a["condition"]]
+    if not valid:
+        valid = [apps[-1]]
+    return sorted(valid, key=lambda x: x["score"], reverse=True)[:3]
+
+def safety_eval(soh, years, cycles):
+    score = soh - years * 1.5 - cycles * 0.005
+    if score >= 80:
+        return "안전", "#00d4aa", "정상 범위 내 운용 가능합니다."
+    elif score >= 65:
+        return "주의", "#f0a500", "주기적 점검이 필요합니다."
+    else:
+        return "위험", "#e05555", "재사용보다 재활용 공정 투입을 권장합니다."
+
+# ─────────────────────────────────────────────
+# UI
+# ─────────────────────────────────────────────
+st.markdown('<div class="main-title">🔋 배터리 Second-Life 추천 플랫폼</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">EIS 데이터 기반 AI 진단 · 최적 활용처 추천</div>', unsafe_allow_html=True)
+
+# 사이드바
+with st.sidebar:
+    st.header("⚙️ 설정")
+    data_path = st.text_input(
+        "학습 데이터 경로",
+        value=r"C:\Users\h0400\Desktop\DIB_Data\.csvfiles\EIS_Test"
+    )
+    if st.button("🚀 모델 학습", type="primary", use_container_width=True):
+        with st.spinner("모델 학습 중..."):
+            model, n = load_model(data_path)
+            if model:
+                st.success(f"✅ 학습 완료! ({n}개 파일)")
+            else:
+                st.error("❌ 파일을 찾을 수 없습니다.")
+
+    st.divider()
+    st.markdown("**데이터셋 정보**")
+    st.markdown("- Warwick DIB Dataset")
+    st.markdown("- SOH: 80 / 85 / 90 / 95 / 100%")
+    st.markdown("- 온도: 15 / 25 / 35°C")
+    st.markdown("- 총 360개 파일")
+
+# ─── 배터리 기본 정보 입력 ───
+st.markdown('<div class="section-title">📋 배터리 기본 정보 입력</div>', unsafe_allow_html=True)
+
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    bat_type = st.selectbox("배터리 종류", ["NCM", "LFP", "NCA", "LCO"])
+with c2:
+    years = st.number_input("사용 연수 (년)", min_value=0, max_value=20, value=5)
+with c3:
+    cycles = st.number_input("충방전 횟수 (회)", min_value=0, max_value=3000, value=500, step=50)
+with c4:
+    voltage = st.number_input("현재 전압 (V)", min_value=2.5, max_value=4.5, value=3.7, step=0.01)
+
+# ─── EIS 파일 업로드 ───
+st.markdown('<div class="section-title">📂 EIS 파일 업로드</div>', unsafe_allow_html=True)
+uploaded = st.file_uploader("EIS 측정 파일 (.xls)", type=["xls"])
+
+if uploaded:
+    df = pd.read_excel(uploaded, engine='xlrd', header=None)
+    df.columns = ['freq', 'z_real', 'z_imag']
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown('<div class="section-title">📈 나이퀴스트 플롯</div>', unsafe_allow_html=True)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=df['z_real'], y=-df['z_imag'],
+            mode='lines+markers',
+            marker=dict(color=np.log10(df['freq']), colorscale='Plasma', size=7,
+                        colorbar=dict(title="log₁₀(Hz)", thickness=12)),
+            line=dict(color='rgba(255,255,255,0.2)', width=1.5),
+        ))
+        fig.update_layout(
+            xaxis_title="Z' (실수부, Ω)", yaxis_title="-Z'' (허수부, Ω)",
+            template='plotly_dark', height=320, margin=dict(l=0,r=0,t=10,b=0)
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        st.markdown('<div class="section-title">📊 임피던스 크기</div>', unsafe_allow_html=True)
+        z_mag = np.sqrt(df['z_real']**2 + df['z_imag']**2) * 1000
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(
+            x=df['freq'], y=z_mag,
+            mode='lines+markers',
+            line=dict(color='#00d4aa', width=2),
+            marker=dict(size=5)
+        ))
+        fig2.update_layout(
+            xaxis_title="주파수 (Hz)", xaxis_type="log",
+            yaxis_title="|Z| (mΩ)",
+            template='plotly_dark', height=320, margin=dict(l=0,r=0,t=10,b=0)
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # AI 분석
+    st.divider()
+    model, _ = load_model(data_path)
+
+    if model is None:
+        st.warning("⚠️ 사이드바에서 '모델 학습' 버튼을 먼저 눌러주세요!")
+    else:
+        feats    = extract_features(df)
+        soh_pred = float(model.predict(feats)[0])
+        soh_pred = round(min(100, max(50, soh_pred)), 1)
+
+        # ─── SOH + 기본 지표 ───
+        st.markdown('<div class="section-title">🤖 AI 진단 결과</div>', unsafe_allow_html=True)
+        m1, m2, m3, m4, m5 = st.columns(5)
+
+        status_map = {
+            soh_pred >= 85: ("양호", "#00d4aa"),
+            soh_pred >= 70: ("보통", "#f0a500"),
+            soh_pred < 70:  ("주의", "#e05555"),
+        }
+        status_txt, status_color = next((v for k,v in status_map.items() if k), ("주의","#e05555"))
+
+        re_val  = round(df['z_real'].iloc[0] * 1000, 2)
+        rct_val = round((df['z_real'].max() - df['z_real'].iloc[0]) * 1000, 2)
+
+        for col, val, label in zip(
+            [m1, m2, m3, m4, m5],
+            [f"{soh_pred}%", f"{re_val}mΩ", f"{rct_val}mΩ", f"{voltage}V", status_txt],
+            ["예측 SOH", "전해질 저항(Re)", "전하전달 저항(Rct)", "현재 전압", "배터리 상태"]
+        ):
+            color = status_color if label == "배터리 상태" else "#00d4aa"
+            col.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-val" style="color:{color}">{val}</div>
+                <div class="metric-label">{label}</div>
+            </div>""", unsafe_allow_html=True)
+
+        # ─── 안전성 평가 ───
+        st.markdown('<div class="section-title">🛡️ 안전성 평가</div>', unsafe_allow_html=True)
+        safety_txt, safety_color, safety_desc = safety_eval(soh_pred, years, cycles)
+        st.markdown(f"""
+        <div class="metric-card" style="text-align:left; border:2px solid {safety_color};">
+            <span style="font-size:20px; font-weight:700; color:{safety_color}">
+                {safety_txt}
+            </span>
+            <span style="font-size:14px; color:#ccc; margin-left:12px;">{safety_desc}</span>
+        </div>""", unsafe_allow_html=True)
+
+        # ─── 추천 활용처 ───
+        st.markdown('<div class="section-title">🎯 추천 활용처</div>', unsafe_allow_html=True)
+        recs = get_recommendations(soh_pred, years, cycles, bat_type)
+
+        for i, rec in enumerate(recs):
+            card_class = "rec-card top-card" if i == 0 else "rec-card"
+            rank_label = "✦ 최우선 추천" if i == 0 else f"{i+1}순위 추천"
+            st.markdown(f"""
+            <div class="{card_class}">
+                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+                    <div>
+                        <div style="font-size:16px; font-weight:600;">{rec['icon']} {rec['name']}</div>
+                        <div style="font-size:12px; color:#aaa;">{rank_label} · 적합도 {round(rec['score'])}%</div>
+                        <div style="font-size:13px; color:#bbb; margin-top:6px;">{rec['desc']}</div>
+                    </div>
+                    <div style="display:flex; gap:20px; flex-wrap:wrap;">
+                        <div style="text-align:center;">
+                            <div style="font-size:18px; font-weight:600; color:#00d4aa;">{rec['life']}년</div>
+                            <div style="font-size:11px; color:#aaa;">예상 잔존수명</div>
+                        </div>
+                        <div style="text-align:center;">
+                            <div style="font-size:18px; font-weight:600; color:#00d4aa;">{rec['value']}만원</div>
+                            <div style="font-size:11px; color:#aaa;">경제적 가치</div>
+                        </div>
+                        <div style="text-align:center;">
+                            <div style="font-size:18px; font-weight:600; color:#00d4aa;">{rec['carbon']}kg</div>
+                            <div style="font-size:11px; color:#aaa;">CO₂ 절감</div>
+                        </div>
+                    </div>
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+        # ─── 에너지 임팩트 ───
+        st.markdown('<div class="section-title">🌍 에너지 임팩트</div>', unsafe_allow_html=True)
+        i1, i2, i3, i4 = st.columns(4)
+        i1.metric("예측 SOH",       f"{soh_pred}%")
+        i2.metric("CO₂ 절감",       f"{recs[0]['carbon']}kg",  "탄소 감축")
+        i3.metric("경제적 가치",     f"{recs[0]['value']}만원", "재사용 가치")
+        i4.metric("광물 절약",       f"{round(soh_pred*0.05,1)}kg", "리튬·코발트")
+
+        # ─── 재사용 가능 여부 요약 ───
+        st.divider()
+        reusable = soh_pred >= 60
+        color    = "#00d4aa" if reusable else "#e05555"
+        msg      = "✅ 재사용 가능" if reusable else "❌ 재활용 공정 권장"
+        st.markdown(f"""
+        <div style="background:#1a1a2e; border-radius:12px; padding:20px;
+                    border:2px solid {color}; text-align:center;">
+            <div style="font-size:24px; font-weight:700; color:{color}">{msg}</div>
+            <div style="font-size:14px; color:#aaa; margin-top:8px;">
+                배터리 종류: {bat_type} | 사용 연수: {years}년 | 충방전: {cycles}회
+            </div>
+        </div>""", unsafe_allow_html=True)
+
+else:
+    st.info("👆 먼저 사이드바에서 '모델 학습'을 누르고, EIS 파일(.xls)을 업로드해주세요.")
+    st.markdown("""
+    **사용 방법:**
+    1. 배터리 기본 정보 입력 (종류, 연수, 충방전 횟수, 전압)
+    2. 사이드바에서 **모델 학습** 클릭
+    3. EIS 파일 업로드
+    4. AI 진단 결과 및 추천 활용처 확인
+    """)
