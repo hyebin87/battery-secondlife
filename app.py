@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,7 +7,6 @@ from sklearn.model_selection import train_test_split
 import plotly.graph_objects as go
 import io
  
-# ─────────────────────────────────────────────
 st.set_page_config(
     page_title="배터리 Second-Life 추천 플랫폼",
     page_icon="🔋",
@@ -29,18 +29,61 @@ st.markdown("""
 """, unsafe_allow_html=True)
  
 # ─────────────────────────────────────────────
-# 샘플 데이터로 모델 학습 (배포용)
+# 파일 읽기 함수 (xls, xlsx, csv, txt 지원)
+# ─────────────────────────────────────────────
+def read_eis_file(uploaded_file):
+    filename = uploaded_file.name.lower()
+    try:
+        if filename.endswith('.xls'):
+            df = pd.read_excel(uploaded_file, engine='xlrd', header=None)
+        elif filename.endswith('.xlsx'):
+            df = pd.read_excel(uploaded_file, engine='openpyxl', header=None)
+        elif filename.endswith('.csv'):
+            # 구분자 자동 감지
+            content = uploaded_file.read().decode('utf-8')
+            uploaded_file.seek(0)
+            if '\t' in content.split('\n')[0]:
+                df = pd.read_csv(uploaded_file, sep='\t', header=None, comment='#')
+            else:
+                df = pd.read_csv(uploaded_file, sep=',', header=None, comment='#')
+        elif filename.endswith('.txt'):
+            content = uploaded_file.read().decode('utf-8')
+            uploaded_file.seek(0)
+            if '\t' in content.split('\n')[0]:
+                df = pd.read_csv(uploaded_file, sep='\t', header=None, comment='#')
+            else:
+                df = pd.read_csv(uploaded_file, sep=r'\s+', header=None, comment='#')
+        else:
+            return None, "지원하지 않는 파일 형식이에요."
+ 
+        # 숫자 컬럼만 선택
+        df = df.apply(pd.to_numeric, errors='coerce').dropna()
+ 
+        # 최소 3개 컬럼 필요
+        if df.shape[1] < 2:
+            return None, "컬럼이 너무 적어요. 주파수, 실수부, 허수부 데이터가 필요해요."
+ 
+        # 3개 컬럼으로 맞추기
+        if df.shape[1] >= 3:
+            df = df.iloc[:, :3]
+            df.columns = ['freq', 'z_real', 'z_imag']
+        else:
+            df = df.iloc[:, :2]
+            df.columns = ['freq', 'z_real']
+            df['z_imag'] = 0
+ 
+        return df, None
+ 
+    except Exception as e:
+        return None, f"파일 읽기 오류: {str(e)}"
+ 
+# ─────────────────────────────────────────────
+# 모델 (기본 샘플 데이터 기반)
 # ─────────────────────────────────────────────
 @st.cache_resource
-def load_model_from_samples():
-    """
-    실제 DIB 데이터셋의 통계값 기반으로 샘플 데이터 생성
-    SOH 80/85/90/95/100% 각 72개 = 360개
-    """
+def load_default_model():
     np.random.seed(42)
     features, labels = [], []
- 
-    # SOH별 임피던스 특성 (실제 데이터 기반 추정)
     soh_params = {
         100: dict(re=0.022, rct=0.018, zw=0.015),
         95:  dict(re=0.028, rct=0.022, zw=0.018),
@@ -48,50 +91,21 @@ def load_model_from_samples():
         85:  dict(re=0.042, rct=0.038, zw=0.028),
         80:  dict(re=0.052, rct=0.048, zw=0.035),
     }
- 
     for soh, params in soh_params.items():
         for _ in range(72):
             noise = 0.003
-            re    = params['re']  + np.random.normal(0, noise)
-            rct   = params['rct'] + np.random.normal(0, noise)
-            zw    = params['zw']  + np.random.normal(0, noise)
+            re   = params['re']  + np.random.normal(0, noise)
+            rct  = params['rct'] + np.random.normal(0, noise)
+            zw   = params['zw']  + np.random.normal(0, noise)
             z_real_max  = re + rct + zw
             z_imag_min  = -(rct * 0.6 + np.random.normal(0, 0.002))
-            z_imag_max  =  rct * 0.3 + np.random.normal(0, 0.001)
+            z_imag_max  =  rct * 0.3  + np.random.normal(0, 0.001)
             z_real_mean = re + rct * 0.5
             z_imag_std  = abs(z_imag_min) * 0.4
             features.append([re, z_real_max, z_imag_min, z_imag_max, z_real_mean, z_imag_std])
             labels.append(soh)
- 
     X, y = np.array(features), np.array(labels)
     model = GradientBoostingRegressor(n_estimators=200, random_state=42)
-    model.fit(X, y)
-    return model
- 
-# 사용자가 여러 파일 업로드 시 직접 학습
-@st.cache_resource
-def load_model_from_uploads(file_data_tuple):
-    features, labels = [], []
-    for filename, data in file_data_tuple:
-        try:
-            soh = int(filename.split('SOH')[0].split('_')[-1])
-            df  = pd.read_excel(io.BytesIO(data), engine='xlrd', header=None)
-            df.columns = ['freq', 'z_real', 'z_imag']
-            features.append([
-                float(df['z_real'].iloc[0]),
-                float(df['z_real'].max()),
-                float(df['z_imag'].min()),
-                float(df['z_imag'].max()),
-                float(df['z_real'].mean()),
-                float(df['z_imag'].std()),
-            ])
-            labels.append(soh)
-        except:
-            pass
-    if len(features) < 10:
-        return None
-    X, y = np.array(features), np.array(labels)
-    model = GradientBoostingRegressor(n_estimators=100, random_state=42)
     model.fit(X, y)
     return model
  
@@ -110,43 +124,35 @@ def get_recommendations(soh, years, cycles, bat_type):
     cycle_penalty = cycles * 0.002
     apps = [
         {
-            "name": "가정용 ESS",
-            "icon": "🏠",
+            "name": "가정용 ESS",       "icon": "🏠",
             "desc": "저출력 장기 사용. 태양광 패널과 연계해 잉여전력 저장.",
             "score": max(10, soh - age_penalty - cycle_penalty + 5),
             "life":  max(1, round((soh - 60) / 8 - years * 0.1)),
-            "value": round(soh * 2.5),
-            "carbon": round(soh * 8),
+            "value": round(soh * 2.5), "carbon": round(soh * 8),
             "condition": soh >= 75,
         },
         {
-            "name": "태양광 연계 ESS",
-            "icon": "☀️",
+            "name": "태양광 연계 ESS",  "icon": "☀️",
             "desc": "재생에너지 저장에 최적. 낮은 충방전 반복 환경.",
             "score": max(10, soh - age_penalty - cycle_penalty + 10),
             "life":  max(1, round((soh - 65) / 7 - years * 0.1)),
-            "value": round(soh * 3.2),
-            "carbon": round(soh * 12),
+            "value": round(soh * 3.2), "carbon": round(soh * 12),
             "condition": soh >= 70,
         },
         {
-            "name": "통신기지국 백업전원",
-            "icon": "📡",
+            "name": "통신기지국 백업전원", "icon": "📡",
             "desc": "간헐적 방전 환경. 안정적 출력 유지.",
             "score": max(10, soh - age_penalty - cycle_penalty),
             "life":  max(1, round((soh - 55) / 10 - years * 0.1)),
-            "value": round(soh * 2.8),
-            "carbon": round(soh * 7),
+            "value": round(soh * 2.8), "carbon": round(soh * 7),
             "condition": soh >= 65,
         },
         {
-            "name": "UPS 비상전원",
-            "icon": "🏥",
+            "name": "UPS 비상전원",      "icon": "🏥",
             "desc": "병원·데이터센터 비상전원. 단기 방전 위주.",
             "score": max(10, soh - age_penalty - cycle_penalty - 5),
             "life":  max(1, round((soh - 50) / 12 - years * 0.1)),
-            "value": round(soh * 2.2),
-            "carbon": round(soh * 6),
+            "value": round(soh * 2.2), "carbon": round(soh * 6),
             "condition": soh >= 60,
         },
     ]
@@ -168,38 +174,17 @@ def safety_eval(soh, years, cycles):
 # UI
 # ─────────────────────────────────────────────
 st.markdown('<div class="main-title">🔋 배터리 Second-Life 추천 플랫폼</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">EIS 데이터 기반 AI 진단 · 최적 활용처 추천 | Powered by Warwick DIB Dataset</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">EIS 데이터 기반 AI 진단 · 최적 활용처 추천</div>', unsafe_allow_html=True)
  
-# 사이드바
 with st.sidebar:
-    st.header("⚙️ 모델 설정")
-    model_mode = st.radio(
-        "학습 데이터 선택",
-        ["기본 모델 사용 (바로 시작)", "내 데이터로 학습 (고급)"],
-        index=0
-    )
- 
-    if model_mode == "내 데이터로 학습 (고급)":
-        train_files = st.file_uploader(
-            "학습용 EIS 파일 업로드 (여러 개)",
-            type=["xls"],
-            accept_multiple_files=True,
-            help="파일명에 SOH 정보가 포함되어야 합니다. 예: Cell02_95SOH_..."
-        )
-        if train_files and len(train_files) >= 10:
-            file_data = tuple((f.name, f.read()) for f in train_files)
-            with st.spinner("학습 중..."):
-                custom_model = load_model_from_uploads(file_data)
-            if custom_model:
-                st.success(f"✅ 학습 완료! ({len(train_files)}개)")
-                st.session_state['model'] = custom_model
-        elif train_files:
-            st.warning("10개 이상 업로드해주세요.")
-    else:
-        with st.spinner("기본 모델 로딩 중..."):
-            st.session_state['model'] = load_model_from_samples()
-        st.success("✅ 기본 모델 준비 완료!")
- 
+    st.header("⚙️ 설정")
+    st.success("✅ 기본 모델 준비 완료!")
+    st.divider()
+    st.markdown("**지원 파일 형식**")
+    st.markdown("- `.xls` (Excel 97-2003)")
+    st.markdown("- `.xlsx` (Excel)")
+    st.markdown("- `.csv` (쉼표/탭 구분)")
+    st.markdown("- `.txt` (공백/탭 구분)")
     st.divider()
     st.markdown("**데이터셋 정보**")
     st.markdown("- Warwick DIB Dataset")
@@ -207,7 +192,7 @@ with st.sidebar:
     st.markdown("- 온도: 15 / 25 / 35°C")
     st.markdown("- 총 360개 파일")
  
-# ─── 배터리 기본 정보 ───
+# 배터리 기본 정보
 st.markdown('<div class="section-title">📋 배터리 기본 정보 입력</div>', unsafe_allow_html=True)
 c1, c2, c3, c4 = st.columns(4)
 with c1:
@@ -219,63 +204,70 @@ with c3:
 with c4:
     voltage = st.number_input("현재 전압 (V)", min_value=2.5, max_value=4.5, value=3.7, step=0.01)
  
-# ─── EIS 파일 업로드 ───
-st.markdown('<div class="section-title">📂 분석할 EIS 파일 업로드</div>', unsafe_allow_html=True)
-uploaded = st.file_uploader("EIS 측정 파일 (.xls)", type=["xls"], key="analysis_file")
+# EIS 파일 업로드
+st.markdown('<div class="section-title">📂 EIS 파일 업로드</div>', unsafe_allow_html=True)
+uploaded = st.file_uploader(
+    "EIS 측정 파일 업로드",
+    type=["xls", "xlsx", "csv", "txt"],
+    help="xls, xlsx, csv, txt 형식 모두 지원합니다."
+)
  
 if uploaded:
-    df = pd.read_excel(uploaded, engine='xlrd', header=None)
-    df.columns = ['freq', 'z_real', 'z_imag']
+    df, error = read_eis_file(uploaded)
  
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown('<div class="section-title">📈 나이퀴스트 플롯</div>', unsafe_allow_html=True)
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=df['z_real'], y=-df['z_imag'],
-            mode='lines+markers',
-            marker=dict(color=np.log10(df['freq']), colorscale='Plasma', size=7,
-                        colorbar=dict(title="log₁₀(Hz)", thickness=12)),
-            line=dict(color='rgba(255,255,255,0.2)', width=1.5),
-        ))
-        fig.update_layout(
-            xaxis_title="Z' (실수부, Ω)", yaxis_title="-Z'' (허수부, Ω)",
-            template='plotly_dark', height=320, margin=dict(l=0,r=0,t=10,b=0)
-        )
-        st.plotly_chart(fig, use_container_width=True)
- 
-    with col2:
-        st.markdown('<div class="section-title">📊 임피던스 크기</div>', unsafe_allow_html=True)
-        z_mag = np.sqrt(df['z_real']**2 + df['z_imag']**2) * 1000
-        fig2 = go.Figure()
-        fig2.add_trace(go.Scatter(
-            x=df['freq'], y=z_mag,
-            mode='lines+markers',
-            line=dict(color='#00d4aa', width=2),
-            marker=dict(size=5)
-        ))
-        fig2.update_layout(
-            xaxis_title="주파수 (Hz)", xaxis_type="log",
-            yaxis_title="|Z| (mΩ)",
-            template='plotly_dark', height=320, margin=dict(l=0,r=0,t=10,b=0)
-        )
-        st.plotly_chart(fig2, use_container_width=True)
- 
-    # AI 분석
-    st.divider()
-    model = st.session_state.get('model')
- 
-    if model is None:
-        st.warning("⚠️ 사이드바에서 모델을 먼저 선택해주세요!")
+    if error:
+        st.error(f"❌ {error}")
     else:
+        st.success(f"✅ 파일 읽기 성공! ({len(df)}개 데이터 포인트)")
+ 
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown('<div class="section-title">📈 나이퀴스트 플롯</div>', unsafe_allow_html=True)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=df['z_real'], y=-df['z_imag'],
+                mode='lines+markers',
+                marker=dict(
+                    color=np.log10(np.abs(df['freq']) + 1e-10),
+                    colorscale='Plasma', size=7,
+                    colorbar=dict(title="log₁₀(Hz)", thickness=12)
+                ),
+                line=dict(color='rgba(255,255,255,0.2)', width=1.5),
+            ))
+            fig.update_layout(
+                xaxis_title="Z' (실수부, Ω)", yaxis_title="-Z'' (허수부, Ω)",
+                template='plotly_dark', height=320, margin=dict(l=0,r=0,t=10,b=0)
+            )
+            st.plotly_chart(fig, use_container_width=True)
+ 
+        with col2:
+            st.markdown('<div class="section-title">📊 임피던스 크기</div>', unsafe_allow_html=True)
+            z_mag = np.sqrt(df['z_real']**2 + df['z_imag']**2) * 1000
+            fig2 = go.Figure()
+            fig2.add_trace(go.Scatter(
+                x=df['freq'], y=z_mag,
+                mode='lines+markers',
+                line=dict(color='#00d4aa', width=2),
+                marker=dict(size=5)
+            ))
+            fig2.update_layout(
+                xaxis_title="주파수 (Hz)", xaxis_type="log",
+                yaxis_title="|Z| (mΩ)",
+                template='plotly_dark', height=320, margin=dict(l=0,r=0,t=10,b=0)
+            )
+            st.plotly_chart(fig2, use_container_width=True)
+ 
+        # AI 분석
+        st.divider()
+        model = load_default_model()
         feats    = extract_features(df)
         soh_pred = float(model.predict(feats)[0])
         soh_pred = round(min(100, max(50, soh_pred)), 1)
  
         st.markdown('<div class="section-title">🤖 AI 진단 결과</div>', unsafe_allow_html=True)
         m1, m2, m3, m4, m5 = st.columns(5)
-        re_val  = round(df['z_real'].iloc[0] * 1000, 2)
-        rct_val = round((df['z_real'].max() - df['z_real'].iloc[0]) * 1000, 2)
+        re_val       = round(df['z_real'].iloc[0] * 1000, 2)
+        rct_val      = round((df['z_real'].max() - df['z_real'].iloc[0]) * 1000, 2)
         status_txt   = "양호" if soh_pred >= 85 else "보통" if soh_pred >= 70 else "주의"
         status_color = "#00d4aa" if soh_pred >= 85 else "#f0a500" if soh_pred >= 70 else "#e05555"
  
@@ -354,10 +346,12 @@ if uploaded:
         </div>""", unsafe_allow_html=True)
  
 else:
-    st.info("👆 EIS 파일(.xls)을 업로드하면 AI가 자동으로 분석해드립니다.")
+    st.info("👆 EIS 파일을 업로드하면 AI가 자동으로 분석해드립니다.")
     st.markdown("""
-    **사용 방법:**
-    1. 배터리 기본 정보 입력 (종류, 연수, 충방전 횟수, 전압)
-    2. EIS 파일 업로드
-    3. AI 진단 결과 및 추천 활용처 확인
+    **지원 파일 형식:**
+    - `.xls` / `.xlsx` — Excel 파일
+    - `.csv` — 쉼표 또는 탭 구분
+    - `.txt` — 공백 또는 탭 구분
+    
+    **데이터 형식:** 주파수(Hz) | Z 실수부(Ω) | Z 허수부(Ω)
     """)
